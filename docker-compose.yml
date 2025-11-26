@@ -1,5 +1,6 @@
 version: '3.8'
 
+name: quiz-solver
 services:
   quiz-solver:
     build:
