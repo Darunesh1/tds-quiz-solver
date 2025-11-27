@@ -1,6 +1,7 @@
 version: '3.8'
 
 name: quiz-solver
+
 services:
   quiz-solver:
     build:
@@ -16,9 +17,21 @@ services:
     env_file:
       - .env
     volumes:
-      # Mount source for hot reload (development only)
-      - ./app:/app/app
       - /tmp/quiz-jobs:/tmp/quiz-jobs
     command: >
       sh -c "uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    develop:
+      watch:
+        - action: sync
+          path: ./app
+          target: /app/app
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+            - "*.pyo"
+            - .pytest_cache/
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
 
