@@ -47,26 +47,39 @@ COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-# Install Playwright browsers (Chromium only, headless)
-# Note: This must run AFTER uv sync (playwright needs to be installed first)
-RUN uv run playwright install chromium --with-deps
-
-# Add virtual environment to PATH
+# Add virtual environment to PATH (MUST be before playwright install)
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Create non-root user for security
+# Install Playwright browsers as ROOT with verbose output
+RUN echo "=== Installing Playwright browsers ===" && \
+    uv run playwright install chromium --with-deps && \
+    echo "=== Verifying installation ===" && \
+    ls -la /root/.cache/ms-playwright/ && \
+    if [ ! -d "/root/.cache/ms-playwright/chromium"* ]; then \
+        echo "ERROR: Chromium not found!"; \
+        exit 1; \
+    fi && \
+    echo "✅ Playwright browsers installed successfully"
+
+# Create non-root user
 RUN useradd -m -u 1000 quizuser && \
-    chown -R quizuser:quizuser /app && \
-    mkdir -p /tmp/quiz-jobs && \
-    chown -R quizuser:quizuser /tmp/quiz-jobs
+    mkdir -p /app/data/quiz-jobs && \
+    chown -R quizuser:quizuser /app
+
+# Set Playwright to use root's browser cache
+ENV PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+
+# Give quizuser read access to browser cache
+RUN chmod -R 755 /root && \
+    chmod -R 755 /root/.cache
 
 # Switch to non-root user
 USER quizuser
 
-# Expose port (for documentation, Azure Container Apps ignores this)
+# Expose port
 EXPOSE 8000
 
-# Reset entrypoint (inherited from base image)
+# Reset entrypoint
 ENTRYPOINT []
 
 # Run FastAPI application
