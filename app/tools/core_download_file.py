@@ -11,7 +11,7 @@ logger = setup_logger(__name__)
 
 async def download_file(url: str, job_id: str) -> str:
     """
-    Download a single file into the job-specific directory.
+    Download files into the job-specific directory.
 
     Args:
         url: File URL.
