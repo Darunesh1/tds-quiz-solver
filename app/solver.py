@@ -40,7 +40,7 @@ class QuizSolver:
     def __init__(self, job_id: str):
         self.job_id = job_id
         self.timer = QuestionTimer(timeout=settings.force_submit_time)
-        self.workspace = Path(f"/tmp/quiz-jobs/{job_id}")
+        self.workspace = Path(f"/app/data/quiz-jobs/{job_id}")
         self.workspace.mkdir(parents=True, exist_ok=True)
 
     async def solve_question(self, url: str) -> Dict[str, Any]:
