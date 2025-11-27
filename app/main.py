@@ -13,18 +13,10 @@ from app.llm import llm_client
 from app.logger import setup_logger
 from app.models import HealthResponse, SolveRequest, SolveResponse
 from app.primitives.browser import browser_manager
-from app.utils.exceptions import InvalidSecretError, QuizSolverError
 
-# Import solver (will be implemented in Batch 3)
-# For now, we'll use a dummy function if it doesn't exist
-try:
-    from app.solver import run_solver_job
-except ImportError:
-
-    async def run_solver_job(job_id: str, request: SolveRequest):
-        """Dummy solver for testing until Batch 3."""
-        logger.info(f"🧪 [Dummy Solver] Started job {job_id} for {request.url}")
-
+# Import real solver
+from app.solver import run_solver_job
+from app.utils.exceptions import QuizSolverError
 
 logger = setup_logger(__name__)
 
