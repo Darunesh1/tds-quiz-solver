@@ -35,7 +35,7 @@ class FileDownloader:
         self.max_size_bytes = int(max_size_mb * 1024 * 1024)
         self.timeout = timeout
         self.max_retries = max_retries
-        self.download_dir = Path("/tmp/quiz-jobs")
+        self.download_dir = Path("/app/date/quiz-jobs")
         ensure_dir(self.download_dir)
 
     async def download_file(
