@@ -77,80 +77,34 @@ llm = init_chat_model(
     rate_limiter=rate_limiter,
 ).bind_tools(TOOLS)
 
-# -------------------------------------------------
-# SYSTEM PROMPT (Enhanced for Forensic "Deep Dive")
-# -------------------------------------------------
-SYSTEM_PROMPT = f"""
-<role>
-You are an expert Autonomous Capture-The-Flag (CTF) Solver. 
-**CORE PHILOSOPHY**: The answer (or the clue to find it) is **ALWAYS** present on the webpage. It is NEVER missing. If you cannot see it in the text, it is hidden in an image, an audio file, or a specific HTML attribute.
-Your job is to be a forensic investigator: Scrape -> Detect -> Decode -> Submit.
-</role>
 
-<credentials>
-EMAIL: "{EMAIL}"
-SECRET: "{SECRET}"
-</credentials>
+SYSTEM_PROMPT = f"""You are an autonomous CTF quiz solver. 
 
-<tools>
-1. **`get_rendered_html(url)`**: 
-   - *Usage*: CALL THIS FIRST. Scrapes text AND lists all assets (images, audio, links).
-2. **`download_file(url)`**: 
-   - *Usage*: Downloads files to `LLMFiles/`. Returns the filename.
-3. **`run_code(script)`**: 
-   - *Usage*: Executes Python. Runs INSIDE `LLMFiles/`.
-   - *Constraint*: Access files directly by name (e.g., `pd.read_csv("data.csv")`). DO NOT use `LLMFiles/` prefix in code.
-4. **`ocr_image(image_path)`**:
-   - *Usage*: Extracts text from images. **CRITICAL**: Use this if the page has no obvious text instructions but contains images.
-5. **`transcribe_audio(audio_path)`**:
-   - *Usage*: Converts audio to text.
-6. **`add_dependencies(deps)`**: 
-   - *Usage*: Install libs (e.g., `uv add pandas`).
-7. **`post_request(url, payload)`**: 
-   - *Usage*: Submits answer. Payload: {{"answer": "VAL", "email": "{EMAIL}", "secret": "{SECRET}"}}
-</tools>
+Your goal: Extract questions from webpages, solve them, and submit answers.
 
-<protocol>
-### PHASE 1: DEEP ANALYSIS
-1. Call `get_rendered_html`.
-2. **THE VISUAL CHECK (Crucial)**:
-   - Does the text prompt look incomplete? 
-   - **YES**: The missing data is in an IMAGE or AUDIO file.
-   - **ACTION**: Check the `links`/`images` list from the scraper.
+Available tools:
+- get_rendered_html(url): Scrapes page content and lists all asset URLs
+- download_file(url): Downloads files to LLMFiles/ directory
+- run_code(code): Executes Python (runs inside LLMFiles/)
+- ocr_image(path): Extracts text from images  
+- transcribe_audio(path): Converts audio to text
+- add_dependencies(packages): Installs Python packages
+- post_request(url, payload): Submits JSON payloads
 
-### PHASE 2: FORENSIC EXECUTION
-- **Scenario A: The "Invisible" Text**: 
-  - If the page looks empty but has an image: `download_file(img_url)` -> `ocr_image(local_path)`.
-  - Treat images as screenshots containing the question.
-- **Scenario B: Audio**:
-  - If there is an `.mp3/.wav`: `download_file` -> `transcribe_audio`.
-- **Scenario C: Data Mining**:
-  - If there is a CSV/JSON: `download_file` -> `run_code`.
+Credentials: EMAIL="{EMAIL}", SECRET="{SECRET}"
 
-### PHASE 3: SOLVE & VERIFY
-- **NEVER GUESS**. Use code to calculate.
-- **DEBUGGING**: If a file path fails in `run_code`, read the `stderr` to see the actual file list.
-- **RETRY LOGIC**: If the answer is wrong, assume you missed a constraint (e.g., "Sort by X", "Filter by Y"). Re-read the scraped data.
+Strategy:
+1. Analyze the page structure to identify where the question/data is located
+2. Use appropriate tools to gather and process information
+3. Compute answers programmatically (never guess)
+4. Submit via post_request with: {{"answer": "...", "email": "{EMAIL}", "secret": "{SECRET}"}}
 
-### PHASE 4: SUBMISSION
-1. Submit via `post_request`.
-2. If successful (`correct: true`), call `reset_memory`.
+If a task seems unsolvable after multiple attempts max try 3 times, submit {{"answer": "SKIP", ...}} and move to solve the next question
 
-### EMERGENCY SKIP
-If you fail **3 times** OR time > **175s**, you **MUST** submit:
-`{{ "answer": "SKIP", "email": "{EMAIL}", "secret": "{SECRET}" }}
-</protocol>
-
-<constraints>
-1. **Persistence**: Do not give up because text is missing. Dig into the assets.
-2. **Code Safety**: Do not assume variables persist between `run_code` calls.
-3. **Termination**: If no new URL is returned after success, output: `END`.
-</constraints>
-
-<current_state>
-Session started. The answer is waiting to be found.
-</current_state>
+The server responds with {{"correct": bool, "url": str}}. On success, proceed to the next URL.
+only when the url is null output exactly 'END'
 """
+
 
 prompt = ChatPromptTemplate.from_messages(
     [
@@ -163,168 +117,21 @@ llm_with_prompt = prompt | llm
 
 
 def agent_node(state: AgentState):
+    """Simplified agent that lets LLM handle strategy."""
     messages = state["messages"]
-    current_time = time.time()
-    task_start_time = state.get("task_start_time", current_time)
-    current_attempts = state.get("attempts", 0)
 
-    # 1. ANALYZE LAST TOOL OUTPUT
-    if (
-        messages
-        and isinstance(messages[-1], ToolMessage)
-        and messages[-1].name == "post_request"
-    ):
-        # --- IMPROVED: ROBUSTLY FIND WHAT WE SUBMITTED ---
-        last_tool_call_id = messages[-1].tool_call_id
-        last_submitted_answer = None
+    # Only inject system context, don't force decisions
+    enriched_messages = messages.copy()
 
-        # Look at the tool call that triggered this result
-        for msg in reversed(messages[:-1]):
-            if hasattr(msg, "tool_calls"):
-                for tc in msg.tool_calls:
-                    if tc["id"] == last_tool_call_id:
-                        last_submitted_answer = tc["args"].get("answer")
-                        break
-            if last_submitted_answer:
-                break
-
-        try:
-            data = json.loads(messages[-1].content)
-            is_correct = data.get("correct")
-            next_url = data.get("url")
-
-            # ---------------------------------------------------------
-            # SCENARIO 1: ANSWER IS CORRECT
-            # ---------------------------------------------------------
-            if is_correct:
-                if next_url:
-                    logger.info(f"🚀 Success! Moving to next: {next_url}")
-                    return {
-                        "messages": [
-                            HumanMessage(content=f"Level Complete. New URL: {next_url}")
-                        ],
-                        "task_start_time": current_time,
-                        "attempts": 0,
-                    }
-                else:
-                    logger.info("🏁 Success, but URL is NULL (End of Quiz). Stopping.")
-                    return {"messages": [HumanMessage(content="END")], "attempts": 0}
-
-            # ---------------------------------------------------------
-            # SCENARIO 2: ANSWER IS WRONG
-            # ---------------------------------------------------------
-            else:
-                # A. CHECK IF THIS WAS A "SKIP" ATTEMPT
-                if last_submitted_answer == "SKIP":
-                    # Case 1: Skip worked and gave us a new URL -> MOVE
-                    if next_url and next_url != "UNKNOWN_URL":
-                        logger.info(f"⏭️ Skip Accepted. Moving to next: {next_url}")
-                        return {
-                            "messages": [
-                                HumanMessage(
-                                    content=f"Skipped Level. New URL: {next_url}"
-                                )
-                            ],
-                            "task_start_time": current_time,
-                            "attempts": 0,
-                        }
-
-                    # Case 2: Skip returned NULL URL -> END QUIZ (Your specific request)
-                    elif next_url is None:
-                        logger.info("🏁 Skip returned NULL URL. Game Over. Stopping.")
-                        return {
-                            "messages": [HumanMessage(content="END")],
-                            "attempts": 0,
-                        }
-
-                    # Case 3: Skip failed (correct: false) -> END (Prevent Infinite Loop)
-                    else:
-                        logger.error(
-                            "🛑 Skip Rejected by Server. Terminating to prevent infinite loop."
-                        )
-                        return {
-                            "messages": [HumanMessage(content="END")],
-                            "attempts": 0,
-                        }
-
-                # B. CHECK TIMEOUT (Safety Valve for the "Death Spiral")
-                if (current_time - task_start_time) > 180:
-                    logger.error("🛑 Timeout exceeded during failure. Terminating.")
-                    return {"messages": [HumanMessage(content="END")], "attempts": 0}
-
-                # C. NORMAL RETRY (Attempts 1 & 2)
-                current_attempts += 1
-                logger.warning(
-                    f"❌ Answer Incorrect (Attempt #{current_attempts}). Sleeping 2s..."
-                )
-                time.sleep(2)  # Prevent rapid API hammering
-
-        except Exception as e:
-            current_attempts += 1
-            logger.error(f"⚠️ Error parsing response: {e}")
-            time.sleep(2)  # Safety sleep
-
-    # 2. DYNAMIC URL HUNTING
-    task_url = "UNKNOWN_URL"
-    for msg in reversed(messages):
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                if tool_call["name"] == "get_rendered_html":
-                    task_url = tool_call["args"].get("url")
-                    break
-        if task_url != "UNKNOWN_URL":
-            break
-
-    # 3. FORCE SKIP LOGIC
-    force_skip_message = None
-
-    # Check for Loop
-    if (
-        messages
-        and isinstance(messages[-1], HumanMessage)
-        and "SYSTEM: You have failed" in str(messages[-1].content)
-    ):
-        logger.error("🛑 STUCK IN SKIP LOOP. Terminating.")
-        return {"messages": [HumanMessage(content="END")], "attempts": 0}
-
-    if current_attempts >= 3:
-        logger.warning("🛑 3 Failed Attempts. Forcing SKIP.")
-        force_skip_message = (
-            f"SYSTEM: You have failed {current_attempts} times. STOP TRYING.\n"
-            f"Submit the SKIP payload immediately.\n"
-            f"CRITICAL: The 'url' field in JSON must be '{task_url}'\n"
-            f"PAYLOAD: {{ 'answer': 'SKIP', 'email': '{EMAIL}', 'secret': '{SECRET}', 'url': '{task_url}' }}"
+    # Provide metadata as context, not commands
+    elapsed = time.time() - state.get("task_start_time", time.time())
+    if elapsed > 150:
+        enriched_messages.append(
+            HumanMessage(content=f"Note: {elapsed:.0f}s elapsed on this task.")
         )
 
-    elif (current_time - task_start_time) > 175:
-        logger.warning("⏰ TIMEOUT. Forcing SKIP.")
-        force_skip_message = (
-            f"SYSTEM: Timeout Reached. SKIP to next.\n"
-            f"CRITICAL: The 'url' field in JSON must be '{task_url}'\n"
-            f"PAYLOAD: {{ 'answer': 'SKIP', 'email': '{EMAIL}', 'secret': '{SECRET}', 'url': '{task_url}' }}"
-        )
-
-    # 4. EXECUTION
-    last_human_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            last_human_idx = i
-            break
-    valid_history = (
-        messages[last_human_idx:] if last_human_idx != -1 else messages[-10:]
-    )
-
-    if force_skip_message:
-        valid_history.append(HumanMessage(content=force_skip_message))
-        # Reset attempts effectively to avoid double-triggering,
-        # but ensure we track the skip status in the next loop.
-        current_attempts = 0
-
-    logger.info(f"🧠 Thinking... (Attempts: {current_attempts})")
-    result = llm_with_prompt.invoke({"messages": valid_history})
-    time.sleep(1.5)
-
-    return {"messages": [result], "attempts": current_attempts}
+    result = llm_with_prompt.invoke({"messages": enriched_messages})
+    return {"messages": [result]}
 
 
 def route(state):
