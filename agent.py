@@ -1,183 +1,235 @@
-import json
-import logging
-import os
-import sys
+from langgraph.graph import StateGraph, END, START
+from shared_store import url_time
 import time
-from typing import Annotated, Any, List, TypedDict
-
-from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
-from langchain_core.messages import (
-    HumanMessage,
-    RemoveMessage,
-    SystemMessage,
-    ToolMessage,
-)
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.rate_limiters import InMemoryRateLimiter
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.pregel.main import GraphRecursionError
-
-# Import your tools (Make sure these files are updated!)
 from tools import (
-    add_dependencies,
-    download_file,
-    get_rendered_html,
-    ocr_image,
-    post_request,
-    run_code,
-    transcribe_audio,
-    # reset_memory is technically not needed if we Auto-Reset, but good to keep.
-    # If you deleted it, remove it here.
+    get_rendered_html, download_file, post_request,
+    run_code, add_dependencies, ocr_image_tool, transcribe_audio, encode_image_to_base64
 )
-
+from typing import TypedDict, Annotated, List
+from langchain_core.messages import trim_messages, HumanMessage
+from langchain.chat_models import init_chat_model
+from langgraph.graph.message import add_messages
+import os
+from dotenv import load_dotenv
 load_dotenv()
+
 EMAIL = os.getenv("EMAIL")
 SECRET = os.getenv("SECRET")
-RECURSION_LIMIT = 100  # Lower this to prevent infinite loops
 
-# LOGGING
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("QuizAgent")
+RECURSION_LIMIT = 5000
+MAX_TOKENS = 60000
 
 
+# -------------------------------------------------
 # STATE
+# -------------------------------------------------
 class AgentState(TypedDict):
     messages: Annotated[List, add_messages]
-    task_start_time: float
-    attempts: int  # <--- NEW: Track failed attempts
 
 
 TOOLS = [
-    run_code,
-    get_rendered_html,
-    download_file,
-    post_request,
-    add_dependencies,
-    transcribe_audio,
-    ocr_image,
+    run_code, get_rendered_html, download_file,
+    post_request, add_dependencies, ocr_image_tool, transcribe_audio, encode_image_to_base64
 ]
 
-# LLM SETUP
+
+# -------------------------------------------------
+# LLM INIT
+# -------------------------------------------------
 rate_limiter = InMemoryRateLimiter(
-    requests_per_second=9 / 60, check_every_n_seconds=1, max_bucket_size=9
+    requests_per_second=4 / 60,
+    check_every_n_seconds=1,
+    max_bucket_size=4
 )
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "google_genai")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
 
 llm = init_chat_model(
-    model_provider=LLM_PROVIDER,
-    model=LLM_MODEL,
-    rate_limiter=rate_limiter,
+    model_provider="google_genai",
+    model="gemini-2.5-flash",
+    rate_limiter=rate_limiter
 ).bind_tools(TOOLS)
 
 
-SYSTEM_PROMPT = f"""You are an autonomous CTF quiz solver. 
+# -------------------------------------------------
+# SYSTEM PROMPT
+# -------------------------------------------------
+SYSTEM_PROMPT = f"""
+You are an autonomous quiz-solving agent.
 
-Your goal: Extract questions from webpages, solve them, and submit answers.
+Your job is to:
+1. Load each quiz page from the given URL.
+2. Extract instructions, parameters, and submit endpoint.
+3. Solve tasks exactly.
+4. Submit answers ONLY to the correct endpoint.
+5. Follow new URLs until none remain, then output END.
 
-Available tools:
-- get_rendered_html(url): Scrapes page content and lists all asset URLs
-- download_file(url): Downloads files to LLMFiles/ directory
-- run_code(code): Executes Python (runs inside LLMFiles/)
-- ocr_image(path): Extracts text from images  
-- transcribe_audio(path): Converts audio to text
-- add_dependencies(packages): Installs Python packages
-- post_request(url, payload): Submits JSON payloads
-
-Credentials: EMAIL="{EMAIL}", SECRET="{SECRET}"
-
-Strategy:
-1. Analyze the page structure to identify where the question/data is located
-2. Use appropriate tools to gather and process information
-3. Compute answers programmatically (never guess)
-4. Submit via post_request with: {{"answer": "...", "email": "{EMAIL}", "secret": "{SECRET}"}}
-
-If a task seems unsolvable after multiple attempts max try 3 times, submit {{"answer": "SKIP", ...}} and move to solve the next question
-
-The server responds with {{"correct": bool, "url": str}}. On success, proceed to the next URL.
-only when the url is null output exactly 'END'
+Rules:
+- For base64 generation of an image NEVER use your own code, always use the "encode_image_to_base64" tool that's provided
+- Never hallucinate URLs or fields.
+- Never shorten endpoints.
+- Always inspect server response.
+- Never stop early.
+- Use tools for HTML, downloading, rendering, OCR, or running code.
+- Include:
+    email = {EMAIL}
+    secret = {SECRET}
 """
 
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        # Wrap the string in SystemMessage so LangChain doesn't parse it
-        SystemMessage(content=SYSTEM_PROMPT),
-        MessagesPlaceholder(variable_name="messages"),
-    ]
-)
-llm_with_prompt = prompt | llm
+# -------------------------------------------------
+# NEW NODE: HANDLE MALFORMED JSON
+# -------------------------------------------------
+def handle_malformed_node(state: AgentState):
+    """
+    If the LLM generates invalid JSON, this node sends a correction message
+    so the LLM can try again.
+    """
+    print("--- DETECTED MALFORMED JSON. ASKING AGENT TO RETRY ---")
+    return {
+        "messages": [
+            {
+                "role": "user", 
+                "content": "SYSTEM ERROR: Your last tool call was Malformed (Invalid JSON). Please rewrite the code and try again. Ensure you escape newlines and quotes correctly inside the JSON."
+            }
+        ]
+    }
 
 
+# -------------------------------------------------
+# AGENT NODE
+# -------------------------------------------------
 def agent_node(state: AgentState):
-    """Simplified agent that lets LLM handle strategy."""
-    messages = state["messages"]
+    # --- TIME HANDLING START ---
+    cur_time = time.time()
+    cur_url = os.getenv("url")
+    
+    # SAFE GET: Prevents crash if url is None or not in dict
+    prev_time = url_time.get(cur_url) 
+    offset = os.getenv("offset", "0")
 
-    # Only inject system context, don't force decisions
-    enriched_messages = messages.copy()
+    if prev_time is not None:
+        prev_time = float(prev_time)
+        diff = cur_time - prev_time
 
-    # Provide metadata as context, not commands
-    elapsed = time.time() - state.get("task_start_time", time.time())
-    if elapsed > 150:
-        enriched_messages.append(
-            HumanMessage(content=f"Note: {elapsed:.0f}s elapsed on this task.")
-        )
+        if diff >= 180 or (offset != "0" and (cur_time - float(offset)) > 90):
+            print(f"Timeout exceeded ({diff}s) — instructing LLM to purposely submit wrong answer.")
 
-    result = llm_with_prompt.invoke({"messages": enriched_messages})
+            fail_instruction = """
+            You have exceeded the time limit for this task (over 180 seconds).
+            Immediately call the `post_request` tool and submit a WRONG answer for the CURRENT quiz.
+            """
+
+            # Using HumanMessage (as you correctly implemented)
+            fail_msg = HumanMessage(content=fail_instruction)
+
+            # We invoke the LLM immediately with this new instruction
+            result = llm.invoke(state["messages"] + [fail_msg])
+            return {"messages": [result]}
+    # --- TIME HANDLING END ---
+
+    trimmed_messages = trim_messages(
+        messages=state["messages"],
+        max_tokens=MAX_TOKENS,
+        strategy="last",
+        include_system=True,
+        start_on="human",
+        token_counter=llm, 
+    )
+    
+    # Better check: Does it have a HumanMessage?
+    has_human = any(msg.type == "human" for msg in trimmed_messages)
+    
+    if not has_human:
+        print("WARNING: Context was trimmed too far. Injecting state reminder.")
+        # We remind the agent of the current URL from the environment
+        current_url = os.getenv("url", "Unknown URL")
+        reminder = HumanMessage(content=f"Context cleared due to length. Continue processing URL: {current_url}")
+        
+        # We append this to the trimmed list (temporarily for this invoke)
+        trimmed_messages.append(reminder)
+    # ----------------------------------------
+
+    print(f"--- INVOKING AGENT (Context: {len(trimmed_messages)} items) ---")
+    
+    result = llm.invoke(trimmed_messages)
+
     return {"messages": [result]}
 
 
+# -------------------------------------------------
+# ROUTE LOGIC (UPDATED FOR MALFORMED CALLS)
+# -------------------------------------------------
 def route(state):
-    """
-    Determines the next step in the graph.
-    1. If the Agent/System said "END", stop the graph.
-    2. If the Agent called a tool, go to 'tools'.
-    3. Otherwise, go back to 'agent' (loop).
-    """
-    messages = state["messages"]
-    last_message = messages[-1]
+    last = state["messages"][-1]
+    
+    # 1. CHECK FOR MALFORMED FUNCTION CALLS
+    if "finish_reason" in last.response_metadata:
+        if last.response_metadata["finish_reason"] == "MALFORMED_FUNCTION_CALL":
+            return "handle_malformed"
 
-    # 1. CHECK FOR STOP SIGNAL (From LLM or System)
-    # We strip whitespace to ensure "END " or " END" triggers it.
-    if isinstance(last_message.content, str) and last_message.content.strip() == "END":
-        logger.info("🛑 Stop Signal Detected. Terminating Graph.")
-        return END
-
-    # 2. CHECK FOR TOOL CALLS
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+    # 2. CHECK FOR VALID TOOLS
+    tool_calls = getattr(last, "tool_calls", None)
+    if tool_calls:
+        print("Route → tools")
         return "tools"
 
-    # 3. DEFAULT LOOP
+    # 3. CHECK FOR END
+    content = getattr(last, "content", None)
+    if isinstance(content, str) and content.strip() == "END":
+        return END
+
+    if isinstance(content, list) and len(content) and isinstance(content[0], dict):
+        if content[0].get("text", "").strip() == "END":
+            return END
+
+    print("Route → agent")
     return "agent"
 
 
+# -------------------------------------------------
+# GRAPH
+# -------------------------------------------------
 graph = StateGraph(AgentState)
+
+# Add Nodes
 graph.add_node("agent", agent_node)
 graph.add_node("tools", ToolNode(TOOLS))
+graph.add_node("handle_malformed", handle_malformed_node) # Add the repair node
+
+# Add Edges
 graph.add_edge(START, "agent")
 graph.add_edge("tools", "agent")
-graph.add_conditional_edges("agent", route)
+graph.add_edge("handle_malformed", "agent") # Retry loop
+
+# Conditional Edges
+graph.add_conditional_edges(
+    "agent", 
+    route,
+    {
+        "tools": "tools",
+        "agent": "agent",
+        "handle_malformed": "handle_malformed", # Map the new route
+        END: END
+    }
+)
+
 app = graph.compile()
 
 
+# -------------------------------------------------
+# RUNNER
+# -------------------------------------------------
 def run_agent(url: str):
-    try:
-        app.invoke(
-            {
-                "messages": [HumanMessage(content=f"Solve this: {url}")],
-                "task_start_time": time.time(),
-            },
-            config={"recursion_limit": RECURSION_LIMIT},
-        )
-    except GraphRecursionError:
-        logger.error("🛑 CRITICAL: Recursion Limit Reached. Agent stuck in a loop.")
-        # Optional: You could insert logic here to force-post a skip via raw requests if needed
-    except Exception as e:
-        logger.error(f"💥 Application Error: {e}")
+    # system message is seeded ONCE here
+    initial_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": url}
+    ]
+
+    app.invoke(
+        {"messages": initial_messages},
+        config={"recursion_limit": RECURSION_LIMIT}
+    )
+
+    print("Tasks completed successfully!")
