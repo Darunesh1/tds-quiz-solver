@@ -1,31 +1,41 @@
-from langchain_core.tools import tool
-import requests
 import os
 
+import requests
+from langchain_core.tools import tool
+
+
 @tool
-def download_file(url: str, filename: str) -> str:
+def download_file(url: str, filename: str = None) -> str:
     """
-    Download a file from a URL and save it with the given filename
-    in the current working directory.
+    Download any file (image, audio, data) from a URL.
+
+    Use this for:
+    - Downloading images for OCR processing
+    - Saving audio files for transcription
+    - Fetching data files for analysis
 
     Args:
-        url (str): Direct URL to the file.
-        filename (str): The filename to save the downloaded content as.
+        url: Full URL to download from
+        filename: Optional filename (auto-generates if not provided)
 
     Returns:
-        str: Full path to the saved file.
+        Path to saved file
+
+    Example: download_file('https://example.com/image.png', 'LLMFiles/image.png')
     """
     try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        directory_name = "LLMFiles"
-        os.makedirs(directory_name, exist_ok=True)
-        path = os.path.join(directory_name, filename)
-        with open(path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        if not filename:
+            filename = f"LLMFiles/{url.split('/')[-1]}"
 
-        return filename
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+
+        with open(filename, "wb") as f:
+            f.write(response.content)
+
+        return f"Downloaded to: {filename}"
     except Exception as e:
-        return f"Error downloading file: {str(e)}"
+        return f"Download failed: {str(e)}"
+

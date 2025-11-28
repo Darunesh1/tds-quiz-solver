@@ -1,5 +1,3 @@
-import os
-
 import speech_recognition as sr
 from langchain_core.tools import tool
 from pydub import AudioSegment
@@ -7,9 +5,23 @@ from pydub import AudioSegment
 
 @tool
 def transcribe_audio(audio_path: str) -> str:
-    """Transcribe any audio file (MP3/WAV) to text using speech recognition."""
+    """
+    Transcribe speech from audio files to text.
+
+    Use this for:
+    - Converting spoken numbers/words to text
+    - Processing audio quiz content
+    - Extracting information from recordings
+
+    Args:
+        audio_path: Path to audio file (MP3/WAV)
+
+    Returns:
+        Transcribed text
+
+    Example: transcribe_audio('LLMFiles/audio.mp3')
+    """
     try:
-        # Convert to WAV
         if not audio_path.endswith(".wav"):
             audio = AudioSegment.from_file(audio_path)
             wav_path = audio_path.rsplit(".", 1)[0] + ".wav"
