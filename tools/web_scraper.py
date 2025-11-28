@@ -45,7 +45,7 @@ def get_rendered_html(url: str) -> str:
             content = page.content()
 
             browser.close()
-            logger.info(f"✅ Scraped {len(html_content)} chars from {url}")
+            logger.info(f"✅ Scraped {len(content)} chars from {url}")
             return content
 
     except Exception as e:

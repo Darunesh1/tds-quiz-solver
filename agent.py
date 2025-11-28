@@ -1,10 +1,12 @@
 import logging
 import os
 import sys
+import time
 from typing import Annotated, Any, List, TypedDict
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_ollama import ChatOllama  # ← CRITICAL IMPORT
@@ -93,120 +95,76 @@ else:
     ).bind_tools(TOOLS)
 
 
-# -------------------------------------------------
-# SYSTEM PROMPT
-# -------------------------------------------------
 SYSTEM_PROMPT = f"""
-You are an autonomous quiz-solving agent that solves tasks using tools and code.
+<role>
+You are an elite Autonomous Quiz-Solving Agent. Your goal is to solve multi-stage CTF (Capture The Flag) style challenges programmatically. You operate in a loop: Scrape -> Analyze -> Execute -> Submit -> Transition.
+</role>
 
-CORE WORKFLOW:
-1. Scrape the quiz page → extract instructions and endpoint.
-2. Analyze what's needed (vision, audio, data, math).
-3. Use existing tools OR write code to solve.
-4. Submit answer → follow next URL or END.
+<credentials>
+EMAIL: "{EMAIL}"
+SECRET: "{SECRET}"
+</credentials>
 
-CRITICAL RULES:
+<tools>
+You have access to the following python-defined tools. Do not hallucinate new tools.
+1. `get_rendered_html(url)`: Fetches the DOM (handles dynamic JS). Returns HTML string.
+2. `download_file(url, save_path)`: Downloads assets (images, audio, CSVs).
+3. `ocr_image(image_path)`: Returns text extracted from an image.
+4. `transcribe_audio(audio_path)`: Returns text from an audio file.
+5. `run_code(script)`: Executes Python code in a sandboxed environment. Use this for math, dataframes, and logic.
+   - *CRITICAL*: Print the final result to `stdout` so you can read it.
+   - *DEPENDENCIES*: If a library is missing, install it via `subprocess`.
+6. `post_request(url, payload)`: Sends a JSON POST request.
+   - Payload format: {{"answer": "YOUR_ANSWER", "email": "{EMAIL}", "secret": "{SECRET}"}}
+7. `reset_memory(instruction)`: Clears context. Call ONLY after specific success criteria.
+</tools>
 
-TOOL USAGE:
-- Use existing tools when available: get_rendered_html, download_file, post_request, ocr_image, transcribe_audio.
-- If a tool doesn't exist for the task → IMMEDIATELY use run_code to create solution.
-- NEVER guess answers - always process data programmatically.
+<protocol>
+### PHASE 1: INGESTION
+1. Call `get_rendered_html` on the current URL.
+2. Parse the HTML to find:
+   - The question/task.
+   - The data source (image, audio, text, or file URL).
+   - The submission endpoint (usually `/submit` or similar).
 
-SELF-HEALING APPROACH:
-When you encounter a task type you can't handle:
-1. Identify what's missing (e.g., screenshot capability, image processing).
-2. Use run_code to write Python code that solves it.
-3. Execute the code and use the output.
+### PHASE 2: ANALYSIS & STRATEGY
+1. Determine the domain: **Math**, **Vision**, **Audio**, or **Data Mining**.
+2. **Chain of Thought**: Before calling tools, explicitly state your plan in `<thought>` tags.
+3. *NEVER GUESS*. If you need to count pixels, sum a CSV column, or decode base64, YOU MUST WRITE CODE using `run_code`.
 
-TASK-SPECIFIC HANDLING:
+### PHASE 3: EXECUTION
+- **Vision**: Download -> `ocr_image`.
+- **Audio**: Download -> `transcribe_audio`.
+- **Logic/Math**: Write a Python script to calculate the exact answer.
+- **Data**: Load into pandas, process, and print the result.
 
-VISUAL TASKS (images, canvas, screenshots):
-- If you see <img>, <canvas>, or visual elements:
-  1. Write code to capture/download the image.
-  2. Write code using pytesseract or PIL to extract text via OCR.
-  3. Use extracted text as answer.
-- NEVER submit guesses for visual content.
+### PHASE 4: SUBMISSION
+1. Construct the JSON payload with the credentials provided above.
+2. Call `post_request` to the endpoint found in Phase 1.
 
-AUDIO TASKS:
-- Download audio file.
-- Use transcribe_audio tool OR write code with speech_recognition.
-- Extract and process the spoken content.
+### PHASE 5: EVALUATION & TRANSITION
+- **IF RESPONSE IS `correct: true`**:
+  - Extract the `next_url` from the response.
+  - Call `reset_memory` with the argument: "Previous level solved. Starting new level at {{next_url}}".
+- **IF RESPONSE IS `correct: false`**:
+  - **DO NOT** reset memory.
+  - Enter **DEBUG MODE**:
+    1. Re-read instructions (did you miss a sorting order or formatting rule?).
+    2. Print intermediate variables in `run_code`.
+    3. Try a radically different approach.
+    4. If 5 consecutive failures occur, submit answer: "SKIP_TIMEOUT".
+</protocol>
 
-DATA/MATH TASKS:
-- ALWAYS use run_code for calculations, analysis, transformations.
-- Fetch API data, parse JSON, compute results via code.
-- NEVER compute manually.
+<constraints>
+1. **Output Format**: For simple answers, just output the answer. For complex reasoning, use `<thought>` tags first.
+2. **Code Safety**: Do not rely on hardcoded values. Extract values dynamically from the HTML/Files.
+3. **Termination**: If the server returns no new URL after a correct submission, output exactly: `END`.
+</constraints>
 
-CODE WRITING GUIDELINES:
-- Install missing libraries first: run_code("import subprocess; subprocess.run(['uv', 'add ', 'library_name'])")
-- Write complete, executable code.
-- Handle errors gracefully.
-- Print results clearly.
-
-EXAMPLE: Visual Quiz Without Screenshot Tool
-Step 1: Write code to screenshot and OCR
-run_code('''
-from playwright.sync_api import sync_playwright
-import pytesseract
-from PIL import Image
-
-with sync_playwright() as p:
-    browser = p.chromium.launch()
-    page = browser.new_page()
-    page.goto("QUIZ_URL")
-    page.screenshot(path="LLMFiles/quiz.png")
-    browser.close()
-
-text = pytesseract.image_to_string(Image.open("LLMFiles/quiz.png"))
-print(text.strip())
-''')
-Step 2: Use output as answer
-    
-TIME MANAGEMENT & SKIPPING RULES (CRITICAL):
-1. CHECK DELAY: Every server response has a "delay" field (seconds elapsed).
-2. IF DELAY > 175s (2.55 minutes):
-   - STOP trying to solve the current task.
-   - IMMEDIATELY submit a "SKIP" or partial answer to the endpoint.
-   - The goal is to get the NEXT URL before the 3-minute hard limit kills the session.
-   
-3. IF ANSWER IS WRONG 3 TIMES:
-   - STOP retrying.
-   - Submit a final attempt or move to next step if server allows.
-
-SKIP STRATEGY:
-- If you are stuck or time is running out (>175s):
-  - Submit a JSON payload with: answer="partial answer you generated", email="{EMAIL}", secret="{SECRET}"
-  - This forces a response. If response has new URL, GO TO IT IMMEDIATELY.
-  - Do not waste time perfecting one answer if it risks the whole session.
-
-YOUR PRIORITY:
-1. Solve correctly (if < 175s delay)
-2. Skip/Submit anyway (if > 175s delay)
-3. Get next URL -> Keep session alive
-
-RESPONSE FORMAT:
-- Continue until server response has no new URL.
-- Then respond with: END
-
-CREDENTIALS:
-- Email: {EMAIL}
-- Secret: {SECRET}
-- ENDPOINT VERIFICATION**: 
-- Look for <form action="..."> or specific text like "Submit to: /submit/X".
-- NEVER submit to .json, .css, .js files. 
-- The submission URL usually contains "submit".
-- If you get a 404, STOP and re-read the page instructions to find the real endpoint.
-IF YOU GET A 404 ERROR:
-1. You are sending to the WRONG URL.
-2. Re-read the HTML content using get_rendered_html.
-3. Look for the text "submit" or "endpoint".
-4. Try the correct URL (e.g., change /q1.json to /submit/1).
-
-
-
-REMEMBER: Code solves everything. If unsure, write code. Never guess visual/audio content.
+<current_state>
+You are starting a new session.
+</current_state>
 """
-
 
 prompt = ChatPromptTemplate.from_messages(
     [("system", SYSTEM_PROMPT), MessagesPlaceholder(variable_name="messages")]
@@ -223,45 +181,52 @@ llm_with_prompt = prompt | llm
 def agent_node(state: AgentState):
     messages = state["messages"]
 
-    # FORCE RESET: Since each task is independent, we only need:
-    # 1. The very first message (User URL/Instruction) - actually, usually just the LAST user instruction.
-    # But wait, if we are in a loop of steps for ONE task, we need context of that task.
+    # ------------------------------------------------------------------
+    # 1. HARD RESET LOGIC: Physically delete old messages
+    # ------------------------------------------------------------------
+    if (
+        messages
+        and isinstance(messages[-1], ToolMessage)
+        and "__RESET__:" in messages[-1].content
+    ):
+        # Extract instruction
+        next_task_instruction = messages[-1].content.split("__RESET__:", 1)[1]
 
-    # If we truly want independence per task, we rely on the System Prompt + Current Input.
-    # However, LangGraph accumulates all messages in `state["messages"]`.
+        logger.info(f"🧹 MEMORY WIPE TRIGGERED. Deleting {len(messages)} messages...")
 
-    # ROBUST STRATEGY:
-    # Find the LAST HumanMessage. That is the start of the CURRENT task.
-    # Discard everything before it.
+        # Create a list of RemoveMessage operations for every message in history
+        # Note: LangGraph assigns IDs to messages automatically during execution.
+        delete_operations = [RemoveMessage(id=m.id) for m in messages if m.id]
 
+        # Create the new starting message
+        new_task_message = HumanMessage(content=f"New Task: {next_task_instruction}")
+
+        # Return the deletions AND the new message
+        # This clears the state and sets the new prompt in one go.
+        return {"messages": delete_operations + [new_task_message]}
+
+    # ------------------------------------------------------------------
+    # 2. HISTORY FILTERING (Backup Safety)
+    # ------------------------------------------------------------------
+    # Even with Hard Reset, we keep this to ensure the current run is clean
     last_human_idx = -1
     for i in range(len(messages) - 1, -1, -1):
-        if messages[i].type == "human":
+        if isinstance(messages[i], HumanMessage):
             last_human_idx = i
             break
 
     if last_human_idx != -1:
-        # Keep ONLY from the last human message onwards.
-        # This includes the current instructions and any tool steps taken SO FAR for this specific task.
-        # It discards all previous solved tasks.
         valid_history = messages[last_human_idx:]
     else:
-        # Fallback (shouldn't happen if started correctly)
-        valid_history = messages[-1:]
+        valid_history = messages[-10:]
 
-    # Log what we are sending
-    logger.info(f"🧠 Agent thinking... (Context size: {len(valid_history)} messages)")
+    # ------------------------------------------------------------------
+    # 3. EXECUTION
+    # ------------------------------------------------------------------
+    # time.sleep(5)  # Uncomment if rate limits are tight
 
-    # Call LLM with only the current task's history
+    # Call LLM with the CLEAN history
     result = llm_with_prompt.invoke({"messages": valid_history})
-    # LOG THE DECISION
-    if result.tool_calls:
-        tools_called = [t["name"] for t in result.tool_calls]
-        logger.info(f"🤖 AI decided to call tools: {tools_called}")
-    else:
-        logger.info(
-            f"🤖 AI Response: {result.content[:200]}..."
-        )  # Truncate long thoughts
 
     return {"messages": [result]}
 
