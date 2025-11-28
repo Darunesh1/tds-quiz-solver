@@ -75,25 +75,27 @@ def planning_prompt(
         4. Decide which tools you will need (web_scraper, download_file, run_code, send_request, etc).
         5. Produce an initial submission template.
 
+       
         Respond in STRICT JSON with this structure:
 
-        {
-            "understanding": "brief description of what the question asks",
+        {{
+          "understanding": "brief description of what the question asks",
           "submit_url": "path or full URL where the answer JSON should be POSTed",
           "answer_format": "description of expected answer format",
-          "submission_template": {
-                "email": "to be filled by system",
+          "submission_template": {{
+            "email": "to be filled by system",
             "secret": "to be filled by you when known",
             "url": "to be filled by system with current question URL",
             "answer": null
-          },
+          }},
           "tools_needed": ["tool_name1", "tool_name2", ...],
           "plan": [
             "Step 1 ...",
             "Step 2 ...",
             "Step 3 ..."
           ]
-        }
+        }}
+
         """
     ).strip()
 
