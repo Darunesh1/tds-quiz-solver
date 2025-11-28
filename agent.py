@@ -1,4 +1,6 @@
+import logging
 import os
+import sys
 from typing import Annotated, Any, List, TypedDict
 
 from dotenv import load_dotenv
@@ -27,6 +29,15 @@ SECRET = os.getenv("SECRET")
 RECURSION_LIMIT = 5000
 
 
+# CONFIGURE GLOBAL LOGGING
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("QuizAgent")
+
+
 # -------------------------------------------------
 # STATE
 # -------------------------------------------------
@@ -52,7 +63,7 @@ rate_limiter = InMemoryRateLimiter(
     requests_per_second=9 / 60, check_every_n_seconds=1, max_bucket_size=9
 )
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "google_genai")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")  # Default model name
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")  # Default model name
 AI_PIPE_API_KEY = os.getenv("AI_PIPE_API_KEY")
 
 if LLM_PROVIDER == "ollama":
@@ -127,7 +138,7 @@ DATA/MATH TASKS:
 - NEVER compute manually.
 
 CODE WRITING GUIDELINES:
-- Install missing libraries first: run_code("import subprocess; subprocess.run(['pip', 'install', 'library_name'])")
+- Install missing libraries first: run_code("import subprocess; subprocess.run(['uv', 'add ', 'library_name'])")
 - Write complete, executable code.
 - Handle errors gracefully.
 - Print results clearly.
@@ -210,12 +221,48 @@ llm_with_prompt = prompt | llm
 
 
 def agent_node(state: AgentState):
-    # TOKEN SAVER: Only use the last 5 messages for context
-    # This ignores the history of previous quiz levels
-    # System prompt is added automatically by the 'prompt' template
-    recent_history = state["messages"][-5:]
+    messages = state["messages"]
 
-    result = llm_with_prompt.invoke({"messages": recent_history})
+    # FORCE RESET: Since each task is independent, we only need:
+    # 1. The very first message (User URL/Instruction) - actually, usually just the LAST user instruction.
+    # But wait, if we are in a loop of steps for ONE task, we need context of that task.
+
+    # If we truly want independence per task, we rely on the System Prompt + Current Input.
+    # However, LangGraph accumulates all messages in `state["messages"]`.
+
+    # ROBUST STRATEGY:
+    # Find the LAST HumanMessage. That is the start of the CURRENT task.
+    # Discard everything before it.
+
+    last_human_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].type == "human":
+            last_human_idx = i
+            break
+
+    if last_human_idx != -1:
+        # Keep ONLY from the last human message onwards.
+        # This includes the current instructions and any tool steps taken SO FAR for this specific task.
+        # It discards all previous solved tasks.
+        valid_history = messages[last_human_idx:]
+    else:
+        # Fallback (shouldn't happen if started correctly)
+        valid_history = messages[-1:]
+
+    # Log what we are sending
+    logger.info(f"🧠 Agent thinking... (Context size: {len(valid_history)} messages)")
+
+    # Call LLM with only the current task's history
+    result = llm_with_prompt.invoke({"messages": valid_history})
+    # LOG THE DECISION
+    if result.tool_calls:
+        tools_called = [t["name"] for t in result.tool_calls]
+        logger.info(f"🤖 AI decided to call tools: {tools_called}")
+    else:
+        logger.info(
+            f"🤖 AI Response: {result.content[:200]}..."
+        )  # Truncate long thoughts
+
     return {"messages": [result]}
 
 
