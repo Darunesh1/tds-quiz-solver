@@ -22,4 +22,5 @@ dependencies = [
     "langchain-openai>=1.1.0",
     "openai>=2.8.1",
     "tenacity>=9.1.2",
+    "langchain-core>=1.1.0",
 ]

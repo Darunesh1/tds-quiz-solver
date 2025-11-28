@@ -1,5 +1,3 @@
-version: '3.8'
-
 name: quiz-solver
 
 services:
@@ -10,16 +8,27 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # Use a default secret if not set in the .env file
       - QUIZ_SECRET=${QUIZ_SECRET:-test-secret-123}
-      - AIPIPE_API_KEY=${AIPIPE_API_KEY}
-      - LOG_LEVEL=DEBUG
+      # LOG_LEVEL is necessary for your new logging config
+      - LOG_LEVEL=INFO 
       - HEADLESS=true
+    # Uses variables defined in the .env file (e.g., AI_PIPE_API_KEY)
     env_file:
       - .env
     volumes:
-      - /tmp/quiz-jobs:/tmp/quiz-jobs
+      # Note: Binding a host path here can cause issues if running non-root.
+      # If possible, use an external Docker volume instead of /tmp/quiz-jobs on the host.
+      - /tmp/quiz-jobs:/tmp/quiz-jobs 
+    
+    # --- FIX 1: Corrected Command and App Directory ---
+    # The container runs files inside the /app folder. 
+    # This command tells uvicorn to look inside the /app directory (--app-dir /app)
+    # and load the FastAPI instance named 'app' from the module 'main.py'.
     command: >
-      sh -c "uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+      sh -c "uv run uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir /app --reload"
+      
+    # Configuration for docker compose watch (optional, for development speed)
     develop:
       watch:
         - action: sync
@@ -34,4 +43,3 @@ services:
           path: ./pyproject.toml
         - action: rebuild
           path: ./uv.lock
-

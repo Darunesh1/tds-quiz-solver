@@ -1,171 +1,272 @@
-from langgraph.graph import StateGraph, END, START
-from langchain_core.rate_limiters import InMemoryRateLimiter
-from langgraph.prebuilt import ToolNode
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from tools import get_rendered_html, download_file, post_request, run_code, add_dependencies
-from typing import TypedDict, Annotated, List, Any
-from langchain.chat_models import init_chat_model
-from langgraph.graph.message import add_messages
+import json
+import logging
 import os
+from typing import Annotated, Any, Dict, List, TypedDict
+
 from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+
+# Imports match your tools/__init__.py exactly
+from tools import (
+    adddependencies,
+    downloadfile,
+    getrenderedhtml,
+    listdependencies,
+    postrequest,
+    runcode,
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    force=True,
+)
+logger = logging.getLogger("agent")
+
 load_dotenv()
 
 EMAIL = os.getenv("EMAIL")
 SECRET = os.getenv("SECRET")
-RECURSION_LIMIT =  5000
-# -------------------------------------------------
-# STATE
-# -------------------------------------------------
+RECURSION_LIMIT = 50
+
+
 class AgentState(TypedDict):
-    messages: Annotated[List, add_messages]
+    messages: Annotated[List[Any], add_messages]
 
 
-TOOLS = [run_code, get_rendered_html, download_file, post_request, add_dependencies]
+class SafeToolNode:
+    """Custom ToolNode that handles StructuredTool objects safely."""
+
+    def __init__(self, tools: List[Any]):
+        self.tools = {}
+        for tool in tools:
+            if hasattr(tool, "name"):
+                self.tools[tool.name] = tool
+            else:
+                toolname = getattr(tool, "__name__", "unknown")
+                self.tools[toolname] = tool
+        logger.info(f"🔧 Loaded tools: {list(self.tools.keys())}")
+
+    async def __call__(self, state: AgentState) -> Dict[str, List[Any]]:
+        messages = state["messages"]
+        last_message = messages[-1]
+
+        tool_calls = getattr(last_message, "tool_calls", [])
+        if not tool_calls:
+            return {"messages": messages}
+
+        tool_messages = []
+        for tool_call in tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+
+            logger.info(f"🚀 Calling tool: {tool_name}")
+
+            if tool_name in self.tools:
+                try:
+                    tool = self.tools[tool_name]
+                    # Handle both LangChain StructuredTools and raw functions
+                    result = (
+                        tool.invoke(tool_args)
+                        if hasattr(tool, "invoke")
+                        else tool(tool_args)
+                    )
+
+                    result_str = str(result)
+                    preview = (
+                        result_str[:200] + "..."
+                        if len(result_str) > 200
+                        else result_str
+                    )
+                    logger.info(f"🔍 TOOL RESULT: {preview}")
+
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": result_str,
+                        }
+                    )
+                except Exception as e:
+                    error_msg = f"Tool failed: {str(e)}"
+                    logger.error(f"❌ {error_msg}")
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": error_msg,
+                        }
+                    )
+            else:
+                msg = (
+                    f"Tool {tool_name} not found. Available: {list(self.tools.keys())}"
+                )
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": msg,
+                    }
+                )
+                logger.warning(f"⚠️ {msg}")
+
+        return {"messages": messages + tool_messages}
 
 
-# -------------------------------------------------
-# GEMINI LLM
-# -------------------------------------------------
-rate_limiter = InMemoryRateLimiter(
-    requests_per_second=9/60,  
-    check_every_n_seconds=1,  
-    max_bucket_size=9  
-)
+# Initialize LLM
 provider = os.getenv("LLM_PROVIDER", "google_genai")
 
 if provider == "aipipe":
-    print("🚀 Using AI Pipe (via OpenAI-compatible endpoint)")
-    llm = init_chat_model(
+    logger.info("🚀 INITIALIZING: Using AI Pipe")
+    base_llm = init_chat_model(
+        model="google/gemini-2.5-flash",
         model_provider="openai",
-        # AI Pipe/OpenRouter usually names models like "google/gemini-2.5-flash"
-        # If that fails, try "gemini-2.5-flash"
-        model="google/gemini-2.5-flash", 
-        api_key=os.getenv("AI_PIPE_API_KEY"),
+        api_key=os.getenv("AIPIPE_APIKEY"),
         base_url="https://aipipe.org/openrouter/v1",
-        rate_limiter=rate_limiter
-    ).bind_tools(TOOLS)
+        temperature=0,
+    )
 else:
-    print("🚀 Using Direct Google GenAI")
-    llm = init_chat_model(
-       model_provider="google_genai",
-       model="gemini-2.5-flash",
-       rate_limiter=rate_limiter
-    ).bind_tools(TOOLS)
-
+    logger.info("🚀 INITIALIZING: Using Direct Google GenAI")
+    base_llm = init_chat_model(
+        model="gemini-2.5-flash",
+        model_provider="google_genai",
+        temperature=0,
+    )
 
 # -------------------------------------------------
 # SYSTEM PROMPT
 # -------------------------------------------------
-SYSTEM_PROMPT = f"""
-You are an autonomous quiz-solving agent.
+SYSTEM_PROMPT = f"""You are an autonomous quiz-solving agent for TDS Project 2.
 
-Your job is to:
-1. Load the quiz page from the given URL.
-2. Extract ALL instructions, required parameters, submission rules, and the submit endpoint.
-3. Solve the task exactly as required.
-4. Submit the answer ONLY to the endpoint specified on the current page (never make up URLs).
-5. Read the server response and:
-   - If it contains a new quiz URL → fetch it immediately and continue.
-   - If no new URL is present → return "END".
+Credentials: Email={EMAIL}, Secret={SECRET}
 
-STRICT RULES — FOLLOW EXACTLY:
+TOOLS:
+- getrenderedhtml(url): Fetch HTML.
+- listdependencies(): List installed packages.
+- adddependencies(packages): Install packages.
+- downloadfile(url, filename): Download to LLMFiles/.
+- runcode(code): Execute Python.
+- postrequest(url, payload): Submit answers.
 
-GENERAL RULES:
-- NEVER stop early. Continue solving tasks until no new URL is provided.
-- NEVER hallucinate URLs, endpoints, fields, values, or JSON structure.
-- NEVER shorten or modify URLs. Always submit the full URL.
-- NEVER re-submit unless the server explicitly allows or it's within the 3-minute limit.
-- ALWAYS inspect the server response before deciding what to do next.
-- ALWAYS use the tools provided to fetch, scrape, download, render HTML, or send requests.
+PROCEDURE:
+1. **Analyze**: Use `getrenderedhtml` on the current URL. Find the Task.
+2. **Execute**: Use tools to solve it. (Download files, Run code).
+3. **Submit**: Use `postrequest` to send the answer.
+   Payload keys: "url", "answer", "secret".
 
-TIME LIMIT RULES:
-- Each task has a hard 3-minute limit.
-- The server response includes a "delay" field indicating elapsed time.
-- If your answer is wrong retry again.
+LOOP LOGIC (CRITICAL):
+- The `postrequest` tool returns a JSON response.
+- **IF response contains "url":** You MUST immediately use `getrenderedhtml` on that NEW url. Do NOT stop.
+- **IF response has NO "url" AND correct=True:** You are finished. Output "FINISHED_ALL_TASKS".
+- **IF response has correct=False:** Analyze why, fix code, and RETRY.
 
-STOPPING CONDITION:
-- Only return "END" when a server response explicitly contains NO new URL.
-- DO NOT return END under any other condition.
-
-ADDITIONAL INFORMATION YOU MUST INCLUDE WHEN REQUIRED:
-- Email: {EMAIL}
-- Secret: {SECRET}
-
-YOUR JOB:
-- Follow pages exactly.
-- Extract data reliably.
-- Never guess.
-- Submit correct answers.
-- Continue until no new URL.
-- Then respond with: END
+RULES:
+- Only output "FINISHED_ALL_TASKS" when the server response explicitly stops giving new URLs.
+- Do not chat. Just call tools.
 """
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT),
-    MessagesPlaceholder(variable_name="messages")
-])
-
-llm_with_prompt = prompt | llm
-
-
-# -------------------------------------------------
-# AGENT NODE
-# -------------------------------------------------
-def agent_node(state: AgentState):
-    result = llm_with_prompt.invoke({"messages": state["messages"]})
-    return {"messages": state["messages"] + [result]}
-
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", SYSTEM_PROMPT),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
 
 # -------------------------------------------------
-# GRAPH
+# TOOL BINDING FIX
 # -------------------------------------------------
-def route(state):
-    last = state["messages"][-1]
-    # support both objects (with attributes) and plain dicts
-    tool_calls = None
-    if hasattr(last, "tool_calls"):
-        tool_calls = getattr(last, "tool_calls", None)
-    elif isinstance(last, dict):
-        tool_calls = last.get("tool_calls")
+safetools = [
+    runcode,
+    getrenderedhtml,
+    downloadfile,
+    postrequest,
+    adddependencies,
+    listdependencies,
+]
 
+# FIX: Manually convert tools to OpenAI-format dictionaries first.
+# This passes the underlying function (t.func) instead of the StructuredTool object
+# to bypass the Python 3.12 inspect.signature error.
+try:
+    logger.info("🛠️ Binding tools (with safe conversion)...")
+    tool_schemas = [
+        convert_to_openai_tool(t.func if hasattr(t, "func") else t) for t in safetools
+    ]
+
+    # Bind using the schemas
+    llm_with_tools = base_llm.bind_tools(tool_schemas)
+    logger.info("✅ Tools bound successfully.")
+except Exception as e:
+    logger.error(f"⚠️ Tool binding failed: {e}. Attempting fallback...")
+    # Fallback: Try binding directly (if the specific provider supports it natively)
+    llm_with_tools = base_llm.bind_tools(safetools)
+
+llm_with_prompt = prompt | llm_with_tools
+
+
+def agent_node(state: AgentState) -> Dict[str, List[Any]]:
+    logger.info("🤖 Agent processing...")
+    result = llm_with_prompt.invoke(state["messages"])
+
+    if result.content:
+        logger.info(f"💭 Agent Thought: {result.content}")
+
+    return {"messages": [result]}
+
+
+def should_continue(state: AgentState) -> str:
+    last_message = state["messages"][-1]
+
+    # 1. If the LLM wants to call tools, let it.
+    tool_calls = getattr(last_message, "tool_calls", [])
     if tool_calls:
         return "tools"
-    # get content robustly
-    content = None
-    if hasattr(last, "content"):
-        content = getattr(last, "content", None)
-    elif isinstance(last, dict):
-        content = last.get("content")
 
-    if isinstance(content, str) and content.strip() == "END":
+    # 2. STRICT TERMINATION CHECK
+    content = str(last_message.content).upper()
+    if "FINISHED_ALL_TASKS" in content:
+        logger.info("🛑 Termination signal received. Stopping.")
         return END
-    if isinstance(content, list) and content[0].get("text").strip() == "END":
-        return END
+
+    # 3. Fallback: If agent is chatting but not calling tools, force it to loop.
+    logger.info("🔄 Agent didn't call tools or finish. Looping back.")
     return "agent"
+
+
+# Build graph
+tool_node = SafeToolNode(safetools)
+
 graph = StateGraph(AgentState)
-
 graph.add_node("agent", agent_node)
-graph.add_node("tools", ToolNode(TOOLS))
-
-
+graph.add_node("tools", tool_node)
 
 graph.add_edge(START, "agent")
 graph.add_edge("tools", "agent")
 graph.add_conditional_edges(
-    "agent",    
-    route       
+    "agent", should_continue, {"tools": "tools", "agent": "agent", END: END}
 )
 
 app = graph.compile()
 
 
-# -------------------------------------------------
-# TEST
-# -------------------------------------------------
-def run_agent(url: str) -> str:
-    app.invoke({
-        "messages": [{"role": "user", "content": url}]},
-        config={"recursion_limit": RECURSION_LIMIT},
-    )
-    print("Tasks completed succesfully")
+async def run_agent(url: str) -> None:
+    logger.info(f"🏁 Starting Agent on: {url}")
+    try:
+        # 2. Use the asynchronous method: await app.ainvoke
+        result = await app.ainvoke(
+            {"messages": [{"role": "user", "content": f"Start the quiz at: {url}"}]},
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
+        logger.info("🎉 Agent execution finished successfully.")
+    except Exception as e:
+        logger.error(f"💥 Agent crashed: {e}", exc_info=True)
 
+
+# Export for main.py import
+runagent = run_agent
