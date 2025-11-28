@@ -42,7 +42,7 @@ async def run_solver_job(job_id: str, request: SolveRequest) -> None:
             logger.info(f"QUESTION {question_index}")
             logger.info("============================================================")
 
-            timer = QuestionTimer(timeout=settings.forces_submit_time)
+            timer = QuestionTimer(timeout=settings.force_submit_time)
 
             agent = QuestionAgent(
                 job_id=job_id,
