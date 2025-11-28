@@ -1,73 +1,86 @@
 import json
 import logging
-from typing import Any, Dict, Optional
+import time
 
 import requests
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
+URL_STATS = {}
 
 
 @tool
-def post_request(
-    url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None
-) -> Any:
+def post_request(url: str, payload: dict) -> dict:
     """
-    Send an HTTP POST request to the given URL with the provided payload.
+    Sends a POST request with JSON payload to a specified endpoint.
 
-    This function is designed for LangGraph applications, where it can be wrapped
-    as a Tool or used inside a Runnable to call external APIs, webhooks, or backend
-    services during graph execution.
-    REMEMBER: This a blocking function so it may take a while to return. Wait for the response.
     Args:
-        url (str): The endpoint to send the POST request to.
-        payload (Dict[str, Any]): The JSON-serializable request body.
-        headers (Optional[Dict[str, str]]): Optional HTTP headers to include
-            in the request. If omitted, a default JSON header is applied.
+        url (str): Target endpoint URL
+        payload (dict): JSON-serializable dictionary
 
     Returns:
-        Any: The response body. If the server returns JSON, a parsed dict is
-        returned. Otherwise, the raw text response is returned.
+        dict: Server response (parsed JSON) with added 'status_code' field
+              On error: {'error': <message>}
 
-    Raises:
-        requests.HTTPError: If the server responds with an unsuccessful status.
-        requests.RequestException: For network-related errors.
+    Rate Limiting:
+    - Enforces 2-second delay between requests to same URL
+    - Auto-sleeps 2s on 4xx/5xx errors to preserve quota
+
+    Timeout: 10 seconds
+
+    Headers: Automatically sets 'Content-Type: application/json'
+
+    Example Payload:
+        {
+            "answer": "42",
+            "email": "user@example.com",
+            "secret": "SECRET_KEY"
+        }
+
+    Example:
+        post_request("https://quiz.com/submit", {"answer": "Paris", "email": EMAIL, "secret": SECRET})
     """
-    headers = headers or {"Content-Type": "application/json"}
+
     try:
-        logger.info(f"🚀 SUBMITTING to {url}")
-        logger.info(f"📦 Payload: {payload} with headers {headers}")
-        response = requests.post(url, json=payload, headers=headers)
+        # Track retry stats
+        if url not in URL_STATS:
+            URL_STATS[url] = {"attempts": 0, "last_time": 0}
+        stats = URL_STATS[url]
+        stats["attempts"] += 1
 
-        # Raise on 4xx/5xx
-        response.raise_for_status()
+        # Rate Limit Buffer
+        elapsed = time.time() - stats["last_time"]
+        if elapsed < 2:
+            time.sleep(2)
+        stats["last_time"] = time.time()
 
-        # Try to return JSON, fallback to raw text
-        data = response.json()
-        delay = data.get("delay", 0)
-        delay = delay if isinstance(delay, (int, float)) else 0
-        correct = data.get("correct")
-        if not correct and delay < 180:
-            del data["url"]
-        if delay >= 180:
-            data = {"url": data.get("url")}
-        # print("Got the response: \n", json.dumps(data, indent=4), "\n")
-        logger.info(f"📩 Server Response: {data}")
-        return data
-    except requests.HTTPError as e:
-        # Extract server’s error response
-        err_resp = e.response
+        logger.info(f"🚀 POST {url} (Attempt {stats['attempts']})")
+        logger.info(f"📦 Payload: {json.dumps(payload)[:200]}...")
+
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
 
         try:
-            err_data = err_resp.json()
-        except ValueError:
-            err_data = err_resp.text
+            data = response.json()
+        except:
+            data = {"text": response.text}
 
-        # print("HTTP Error Response:\n", err_data)
-        logger.info(f"📩 HTTP Error Response: {err_data}")
-        return err_data
+        data["status_code"] = response.status_code
+        if response.status_code >= 400:
+            logger.warning(
+                f"⚠️ Request Failed ({response.status_code}). Sleeping for 2.0s to save Quota..."
+            )
+            time.sleep(2.0)
+
+        if response.status_code == 200:
+            logger.info(f"✅ Response: {json.dumps(data)[:200]}...")
+        else:
+            logger.warning(f"⚠️ Response ({response.status_code}): {json.dumps(data)}")
+
+        return data
 
     except Exception as e:
-        print("Unexpected error:", e)
-        return str(e)
+        logger.error(f"💥 POST Failed: {e}")
+        time.sleep(2.0)
+        return {"error": str(e)}
 

@@ -1,41 +1,57 @@
+import logging
 import os
 
 import requests
 from langchain_core.tools import tool
 
+logger = logging.getLogger(__name__)
+
 
 @tool
-def download_file(url: str, filename: str = None) -> str:
+def download_file(url: str) -> str:
     """
-    Download any file (image, audio, data) from a URL.
-
-    Use this for:
-    - Downloading images for OCR processing
-    - Saving audio files for transcription
-    - Fetching data files for analysis
+    Downloads a file from a URL to the local 'LLMFiles/' directory.
 
     Args:
-        url: Full URL to download from
-        filename: Optional filename (auto-generates if not provided)
+        url (str): Direct download URL (supports http/https)
 
     Returns:
-        Path to saved file
+        str: Success: "File saved at: LLMFiles/<filename>"
+             Failure: Error message with details
 
-    Example: download_file('https://example.com/image.png', 'LLMFiles/image.png')
+    File Naming:
+    - Extracts filename from URL (last segment before query params)
+    - Falls back to 'downloaded_file.dat' if no filename found
+
+    Timeout: 30 seconds
+
+    Supported File Types: All (images, PDFs, CSVs, audio, video, etc.)
+
+    Example:
+        download_file("https://example.com/data.csv")
+        # Returns: "File saved at: LLMFiles/data.csv"
     """
+
     try:
+        os.makedirs("LLMFiles", exist_ok=True)
+        filename = url.split("/")[-1].split("?")[0]
         if not filename:
-            filename = f"LLMFiles/{url.split('/')[-1]}"
+            filename = "downloaded_file.dat"
 
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        filepath = os.path.join("LLMFiles", filename)
+        logger.info(f"📥 DOWNLOADING: {url} -> {filepath}")
 
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
 
-        with open(filename, "wb") as f:
-            f.write(response.content)
+        with open(filepath, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-        return f"Downloaded to: {filename}"
+        logger.info("✅ Download Complete")
+        return f"File saved at: {filepath}"
+
     except Exception as e:
+        logger.error(f"💥 Download Failed: {e}")
         return f"Download failed: {str(e)}"
 

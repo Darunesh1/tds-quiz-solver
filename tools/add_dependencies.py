@@ -1,38 +1,47 @@
-from typing import List
-from langchain_core.tools import tool
+import logging
 import subprocess
+
+from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 
 
 @tool
-def add_dependencies(dependencies: List[str]) -> str:
+def add_dependencies(dependencies: str) -> str:
     """
-    Install the given Python packages into the environment.
+    Installs Python packages using the 'uv' package manager.
 
-    Parameters:
-        dependencies (List[str]):
-            A list of Python package names to install. Each name must match the 
-            corresponding package name on PyPI.
+    Args:
+        dependencies (str): Space-separated package names (e.g., "pandas numpy requests")
 
     Returns:
-        str:
-            A message indicating success or failure.
+        str: Success message ("Installed: <packages>") or error details
+
+    Timeout: 60 seconds
+
+    Usage Notes:
+    - Install multiple packages in one call: "pandas numpy matplotlib"
+    - Package names must be valid PyPI identifiers
+    - On error, returns detailed stderr from uv
+
+    Examples:
+        add_dependencies("pandas")
+        add_dependencies("beautifulsoup4 lxml html2text")
     """
 
+    logger.info(f"📦 INSTALLING: {dependencies}")
     try:
-        subprocess.check_call(
-            ["uv", "add"] + dependencies,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+        result = subprocess.run(
+            ["uv", "add"] + dependencies.split(),
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
-        return "Successfully installed dependencies: " + ", ".join(dependencies)
-    
-    except subprocess.CalledProcessError as e:
-        return (
-            "Dependency installation failed.\n"
-            f"Exit code: {e.returncode}\n"
-            f"Error: {e.stderr or 'No error output.'}"
-        )
-    
+        if result.returncode == 0:
+            logger.info("✅ Install Success")
+            return f"Installed: {dependencies}"
+        else:
+            logger.error(f"❌ Install Failed: {result.stderr}")
+            return f"Error installing {dependencies}: {result.stderr}"
     except Exception as e:
-        return f"Unexpected error while installing dependencies: {e}" 
+        return f"Exception: {str(e)}"
