@@ -1,8 +1,11 @@
+import logging
 import os
 import subprocess
 import sys
 
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 
 
 @tool
@@ -30,6 +33,8 @@ def run_code(code: str) -> str:
     - Install: run_code("import subprocess; subprocess.run(['pip', 'install', 'requests'])")
     """
     try:
+        logger.info("💻 EXECUTING Python Code:")
+        logger.info(f"---\n{code[:200]}...\n---")
         runner_path = os.path.join("LLMFiles", "runner.py")
         os.makedirs("LLMFiles", exist_ok=True)
 
@@ -41,6 +46,7 @@ def run_code(code: str) -> str:
         )
 
         output = result.stdout if result.stdout else result.stderr
+        logger.info(f"✅ Execution Result: {output[:100]}...")
         return output or "Code executed successfully (no output)"
     except Exception as e:
         return f"Execution error: {str(e)}"

@@ -1,6 +1,11 @@
+import logging
+
+from bs4 import BeautifulSoup
 from langchain_core.tools import tool
 from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)  # Add this
+
 
 @tool
 def get_rendered_html(url: str) -> str:
@@ -27,7 +32,7 @@ def get_rendered_html(url: str) -> str:
         The fully rendered and cleaned HTML content.
     """
     # ... existing code ...
-    print("\nFetching and rendering:", url)
+    logger.info(f"🌍 SCRAPING: {url}")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -40,7 +45,10 @@ def get_rendered_html(url: str) -> str:
             content = page.content()
 
             browser.close()
+            logger.info(f"✅ Scraped {len(html_content)} chars from {url}")
             return content
 
     except Exception as e:
+        logger.info(f"Error:{url} {str(e)}")
         return f"Error fetching/rendering page: {str(e)}"
+

@@ -1,10 +1,17 @@
-from langchain_core.tools import tool
-import requests
 import json
+import logging
 from typing import Any, Dict, Optional
 
+import requests
+from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
+
+
 @tool
-def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Any:
+def post_request(
+    url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None
+) -> Any:
     """
     Send an HTTP POST request to the given URL with the provided payload.
 
@@ -28,7 +35,8 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
     """
     headers = headers or {"Content-Type": "application/json"}
     try:
-        print(f"\nSending Answer \n{json.dumps(payload, indent=4)}\n to url: {url}")
+        logger.info(f"🚀 SUBMITTING to {url}")
+        logger.info(f"📦 Payload: {payload} with headers {headers}")
         response = requests.post(url, json=payload, headers=headers)
 
         # Raise on 4xx/5xx
@@ -42,10 +50,9 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
         if not correct and delay < 180:
             del data["url"]
         if delay >= 180:
-            data = {
-                "url": data.get("url")
-            }
-        print("Got the response: \n", json.dumps(data, indent=4), '\n')
+            data = {"url": data.get("url")}
+        # print("Got the response: \n", json.dumps(data, indent=4), "\n")
+        logger.info(f"📩 Server Response: {data}")
         return data
     except requests.HTTPError as e:
         # Extract server’s error response
@@ -56,9 +63,11 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
         except ValueError:
             err_data = err_resp.text
 
-        print("HTTP Error Response:\n", err_data)
+        # print("HTTP Error Response:\n", err_data)
+        logger.info(f"📩 HTTP Error Response: {err_data}")
         return err_data
 
     except Exception as e:
         print("Unexpected error:", e)
         return str(e)
+
